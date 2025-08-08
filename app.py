@@ -37,9 +37,10 @@ AZURE_API_VERSION = get_secret("AZURE_API_VERSION", "2024-08-01-preview")
 
 # DALL·E 3
 # If these are blank, we auto-fallback to the Chat/Vision endpoint/key (same resource).
+# If you paste a FULL Images URL (including /images/generations and ?api-version=...), we'll use it as-is.
 AZURE_DALLE_KEY         = get_secret("AZURE_DALLE_KEY", "")
-AZURE_DALLE_ENDPOINT    = get_secret("AZURE_DALLE_ENDPOINT", "")  # leave empty to reuse AZURE_ENDPOINT
-AZURE_DALLE_DEPLOYMENT  = get_secret("AZURE_DALLE_DEPLOYMENT", "dall-e-3")  # must match your Azure deployment name
+AZURE_DALLE_ENDPOINT    = get_secret("AZURE_DALLE_ENDPOINT", "")  # can be a full URL or just the host
+AZURE_DALLE_DEPLOYMENT  = get_secret("AZURE_DALLE_DEPLOYMENT", "dall-e-3")
 AZURE_DALLE_API_VERSION = get_secret("AZURE_DALLE_API_VERSION", "2024-02-01")
 
 if not (AZURE_API_KEY and AZURE_ENDPOINT and AZURE_DEPLOYMENT and AZURE_API_VERSION):
@@ -49,7 +50,7 @@ if not (AZURE_API_KEY and AZURE_ENDPOINT and AZURE_DEPLOYMENT and AZURE_API_VERS
     )
 
 # ---------------------------
-# Prompts & helpers
+# Prompts & helpers (Chat/Vision)
 # ---------------------------
 SYSTEM_PROMPT = """
 You are a teaching assistant. The student has uploaded a notes image.
@@ -96,24 +97,22 @@ def call_azure_chat(payload: dict) -> requests.Response:
     return requests.post(url, headers=headers, params=params, json=payload, timeout=60)
 
 def try_parse_json(text: str):
-    """Try strict JSON, then strip fences, then first {...} block."""
-    # 1) strict
+    # strict
     try:
         return json.loads(text)
     except Exception:
         pass
-    # 2) strip code fences
+    # strip code fences
     t = text.strip()
     if t.startswith("```"):
         t = t.strip("`")
-        # after stripping, there might be "json\n{...}"
         if "\n" in t:
             t = t.split("\n", 1)[1]
     try:
         return json.loads(t)
     except Exception:
         pass
-    # 3) fallback: first {...}
+    # first {...}
     import re
     m = re.search(r"\{.*\}", text, re.DOTALL)
     if m:
@@ -157,48 +156,56 @@ Respond in JSON:
 # ---------------------------
 # DALL·E helpers (Images)
 # ---------------------------
-def _effective_dalle_endpoint() -> str:
-    # If a specific images endpoint isn't provided, reuse the Chat/Vision endpoint
-    return (AZURE_DALLE_ENDPOINT or AZURE_ENDPOINT or "").rstrip("/")
-
 def _effective_dalle_key() -> str:
-    # If an images key isn't provided, reuse the Chat/Vision key
+    # Reuse Chat key if Images key not provided
     return AZURE_DALLE_KEY or AZURE_API_KEY or ""
 
+def _effective_dalle_endpoint() -> str:
+    # Use Images endpoint if provided; else fallback to Chat endpoint
+    return (AZURE_DALLE_ENDPOINT or AZURE_ENDPOINT or "").rstrip("/")
+
+def _is_full_images_url(url: str) -> bool:
+    """True if the provided endpoint already includes /images/generations (possibly with ?api-version=...)."""
+    if not url:
+        return False
+    u = url.lower()
+    return "images/generations" in u
+
 def _images_config_ok() -> bool:
-    return bool(_effective_dalle_endpoint() and _effective_dalle_key() and AZURE_DALLE_DEPLOYMENT and AZURE_DALLE_API_VERSION)
+    return bool(_effective_dalle_endpoint() and _effective_dalle_key())
 
 def call_azure_dalle(prompt: str, size: str = "1024x1024") -> Optional[bytes]:
     """
     Azure OpenAI Images API (DALL·E 3) -> raw image bytes.
-    Common 404 causes:
-      • endpoint must be https://<openai-resource>.openai.azure.com (not cognitiveservices)
-      • deployment name must exactly match your Azure deployment
-      • key must belong to the same resource
-    """
-    if not _images_config_ok():
-        st.error("Missing DALL·E config. Check endpoint/key/deployment/api-version in secrets.")
-        return None
 
+    Supports TWO modes for AZURE_DALLE_ENDPOINT:
+      1) FULL URL pasted (contains '/images/generations' and maybe '?api-version=...') → use as-is.
+      2) HOST only (e.g., https://<resource>.openai.azure.com) → we append the standard path and api-version.
+    """
     endpoint = _effective_dalle_endpoint()
     key = _effective_dalle_key()
 
-    if "openai.azure.com" not in endpoint:
-        st.warning(
-            f"Images endpoint looks suspicious: {endpoint}\n"
-            "Use your Azure **OpenAI** endpoint (…openai.azure.com), not …cognitiveservices.azure.com."
-        )
+    if not _images_config_ok():
+        st.error("Missing DALL·E config. Provide endpoint and key (or rely on Chat/Vision fallbacks).")
+        return None
 
-    url = f"{endpoint}/openai/deployments/{AZURE_DALLE_DEPLOYMENT}/images/generations"
-    params = {"api-version": AZURE_DALLE_API_VERSION}
     headers = {"Content-Type": "application/json", "api-key": key}
     payload = {"prompt": prompt, "n": 1, "size": size}
 
-    r = requests.post(url, headers=headers, params=params, json=payload, timeout=90)
+    if _is_full_images_url(endpoint):
+        # Use EXACT endpoint as given (no extra path/params)
+        url = endpoint  # already includes /images/generations and maybe ?api-version=...
+        r = requests.post(url, headers=headers, json=payload, timeout=90)
+    else:
+        # Build standard Images URL
+        url = f"{endpoint}/openai/deployments/{AZURE_DALLE_DEPLOYMENT}/images/generations"
+        params = {"api-version": AZURE_DALLE_API_VERSION}
+        r = requests.post(url, headers=headers, params=params, json=payload, timeout=90)
+
     if r.status_code != 200:
         st.error(
             f"DALL·E error {r.status_code} from {url}\n"
-            f"deployment='{AZURE_DALLE_DEPLOYMENT}', api-version='{AZURE_DALLE_API_VERSION}'\n"
+            f"(If you pasted a full URL, we are using it verbatim.)\n"
             f"body: {r.text[:500]}"
         )
         return None
@@ -306,12 +313,16 @@ with tab1:
 # ---------------------------
 with tab2:
     st.info("Generate images from prompts s1alt1..s6alt1 in the JSON from Tab 1. No S3 uploads — just preview and download.")
+    # Debug: show what URL we'll call
     with st.expander("Images API config (debug)"):
+        eff_ep = _effective_dalle_endpoint()
         st.write({
-            "endpoint_used": _effective_dalle_endpoint(),
+            "endpoint_provided": AZURE_DALLE_ENDPOINT,
+            "endpoint_used": eff_ep,
+            "treated_as_full_url": _is_full_images_url(eff_ep),
             "deployment": AZURE_DALLE_DEPLOYMENT,
             "api_version": AZURE_DALLE_API_VERSION,
-            "key_present": bool(_effective_dalle_key())
+            "key_present": bool(_effective_dalle_key()),
         })
 
     if "notes_json" not in st.session_state:
