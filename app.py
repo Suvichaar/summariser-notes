@@ -16,7 +16,7 @@ st.set_page_config(
     layout="centered"
 )
 
-st.title("🧠 Notes → Structured JSON Suite")
+st.title("🧠 Notes → AMP Web Story")
 st.caption("Multi-tab app. Tab 1 does Notes → JSON via Azure OpenAI (Vision). Add your other flows in the next tabs.")
 
 # ---------------------------
