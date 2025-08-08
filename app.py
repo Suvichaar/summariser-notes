@@ -40,7 +40,7 @@ def get_secret(key, default=None):
 
 AZURE_API_KEY     = get_secret("AZURE_API_KEY")
 AZURE_ENDPOINT    = get_secret("AZURE_ENDPOINT")
-AZURE_DEPLOYMENT  = get_secret("AZURE_DEPLOYMENT", "gpt-4")
+AZURE_DEPLOYMENT  = get_secret("AZURE_DEPLOYMENT", "gpt-4o")   # ← vision-capable default
 AZURE_API_VERSION = get_secret("AZURE_API_VERSION", "2024-08-01-preview")
 
 DALE_ENDPOINT     = get_secret("DALE_ENDPOINT")  # full URL for images/generations endpoint
@@ -84,20 +84,31 @@ with tab1:
             st.error("Please upload an image first.")
             st.stop()
 
-        # Preview
+        # --- Read bytes ONCE and preview ---
         try:
-            img = Image.open(uploaded_img).convert("RGB")
+            raw_bytes = uploaded_img.getvalue()  # stable bytes in Streamlit
+            if not raw_bytes:
+                st.error("Uploaded file is empty.")
+                st.stop()
+            img = Image.open(BytesIO(raw_bytes)).convert("RGB")
             st.image(img, caption="Uploaded image", use_container_width=True)
         except Exception as e:
             st.error(f"Could not open image: {e}")
             st.stop()
 
-        # Convert to base64
-        img_bytes = uploaded_img.read() if hasattr(uploaded_img, "read") else None
-        if img_bytes is None:
-            uploaded_img.seek(0)
-            img_bytes = uploaded_img.read()
-        base64_img = base64.b64encode(img_bytes).decode("utf-8")
+        # --- Build correct data URL (mime-aware) ---
+        mime = uploaded_img.type or "image/jpeg"  # e.g., "image/png" or "image/jpeg"
+        if not (isinstance(mime, str) and mime.startswith("image/")):
+            mime = "image/jpeg"
+        base64_img = base64.b64encode(raw_bytes).decode("utf-8")
+        if not base64_img:
+            st.error("Base64 encoding failed (empty image data).")
+            st.stop()
+
+        user_content = [
+            {"type": "text", "text": "Please analyze this notes image and return the structured JSON as requested."},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64_img}"}}
+        ]
 
         # ------------ Azure Chat (vision) to get JSON ------------
         system_prompt = """
@@ -136,9 +147,7 @@ Respond strictly in this JSON format:
         payload = {
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}}
-                ]}
+                {"role": "user", "content": user_content}
             ],
             "temperature": 0.7,
             "max_tokens": 1000
@@ -147,7 +156,11 @@ Respond strictly in this JSON format:
         with st.spinner("Generating structured JSON from the image…"):
             res = requests.post(chat_url, headers=headers, json=payload, timeout=120)
             if res.status_code != 200:
-                st.error(f"Azure Chat error: {res.status_code} — {res.text[:300]}")
+                st.error(
+                    "Azure Chat error: "
+                    f"{res.status_code} — {res.text[:300]}\n\n"
+                    "Tip: ensure AZURE_DEPLOYMENT is a vision-capable model like 'gpt-4o' or 'gpt-4o-mini'."
+                )
                 st.stop()
             reply = res.json()["choices"][0]["message"]["content"]
             # Parse JSON (with fallback extraction)
@@ -399,4 +412,3 @@ Respond strictly in this JSON format:
             file_name=out_name,
             mime="application/json"
         )
-
