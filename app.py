@@ -11,13 +11,13 @@ from PIL import Image
 # Streamlit page config
 # ---------------------------
 st.set_page_config(
-    page_title="Notes → Structured JSON (Azure OpenAI Vision)",
+    page_title="Notes → AMP Web Story",
     page_icon="🧠",
     layout="centered"
 )
 
 st.title("🧠 Notes → AMP Web Story")
-st.caption("Multi-tab app. Tab 1 does Notes → JSON via Azure OpenAI (Vision). Add your other flows in the next tabs.")
+st.caption("Tab 1: Notes → JSON (Azure OpenAI Vision). Tab 2: (optional) generate images via Azure DALL·E 3.")
 
 # ---------------------------
 # Secrets / Config (st.secrets)
@@ -28,14 +28,21 @@ def get_secret(name: str, default: str = "") -> str:
     except Exception:
         return default
 
+# Chat/Vision
 AZURE_API_KEY     = get_secret("AZURE_API_KEY")
 AZURE_ENDPOINT    = get_secret("AZURE_ENDPOINT")
 AZURE_DEPLOYMENT  = get_secret("AZURE_DEPLOYMENT", "gpt-4")
 AZURE_API_VERSION = get_secret("AZURE_API_VERSION", "2024-08-01-preview")
 
+# DALL·E 3 (NEW)
+AZURE_DALLE_KEY          = get_secret("AZURE_DALLE_KEY")
+AZURE_DALLE_ENDPOINT     = get_secret("AZURE_DALLE_ENDPOINT")  # e.g. https://<your>.cognitiveservices.azure.com
+AZURE_DALLE_DEPLOYMENT   = get_secret("AZURE_DALLE_DEPLOYMENT", "dall-e-3")
+AZURE_DALLE_API_VERSION  = get_secret("AZURE_DALLE_API_VERSION", "2024-02-01")
+
 if not (AZURE_API_KEY and AZURE_ENDPOINT and AZURE_DEPLOYMENT and AZURE_API_VERSION):
     st.warning(
-        "⚙️ Configure your Azure secrets in `.streamlit/secrets.toml` → "
+        "⚙️ Configure your Azure Chat/Vision secrets in `.streamlit/secrets.toml` → "
         "AZURE_API_KEY, AZURE_ENDPOINT, AZURE_DEPLOYMENT, AZURE_API_VERSION"
     )
 
@@ -130,12 +137,44 @@ Respond in JSON:
             return parsed.get("metadescription", ""), parsed.get("metakeywords", "")
     return "Explore this insightful story.", "web story, learning"
 
+# ---- DALL·E helper (NEW) ----
+def call_azure_dalle(prompt: str, size: str = "1024x1024") -> bytes | None:
+    """
+    Calls Azure OpenAI Images API (DALL·E 3) and returns raw image bytes (JPEG/PNG).
+    """
+    if not (AZURE_DALLE_KEY and AZURE_DALLE_ENDPOINT and AZURE_DALLE_DEPLOYMENT and AZURE_DALLE_API_VERSION):
+        st.error("Missing DALL·E config in secrets (AZURE_DALLE_*).")
+        return None
+
+    url = f"{AZURE_DALLE_ENDPOINT}/openai/deployments/{AZURE_DALLE_DEPLOYMENT}/images/generations?api-version={AZURE_DALLE_API_VERSION}"
+    headers = {"Content-Type": "application/json", "api-key": AZURE_DALLE_KEY}
+    payload = {"prompt": prompt, "n": 1, "size": size}
+
+    r = requests.post(url, headers=headers, json=payload, timeout=90)
+    if r.status_code != 200:
+        st.error(f"DALL·E error {r.status_code}: {r.text[:400]}")
+        return None
+
+    data = r.json()
+    try:
+        img_url = data["data"][0]["url"]
+    except Exception:
+        st.error("DALL·E response missing image URL.")
+        return None
+
+    try:
+        img_bytes = requests.get(img_url, timeout=60).content
+        return img_bytes
+    except Exception as e:
+        st.error(f"Failed to download generated image: {e}")
+        return None
+
 # =========================================================
 # Tabs
 # =========================================================
 tab1, tab2, tab3 = st.tabs([
     "Tab 1 • Notes → JSON",
-    "Tab 2 • (your next feature)",
+    "Tab 2 • DALL·E images (optional)",
     "Tab 3 • (your next feature)"
 ])
 
@@ -175,7 +214,6 @@ with tab1:
                 if not isinstance(parsed, dict):
                     st.error("Model did not return valid JSON. Check your deployment/model settings.")
                 else:
-                    # Enrich JSON
                     if coachingname.strip():
                         parsed["coachingname"] = coachingname.strip()
 
@@ -213,28 +251,56 @@ with tab1:
         except Exception as e:
             st.exception(e)
 
-    # Helper display if JSON already exists from a previous run
     if "notes_json" in st.session_state and not run:
         with st.expander("Last generated JSON (from session)", expanded=False):
             st.json(st.session_state["notes_json"])
 
 # ---------------------------
-# TAB 2: Placeholder
+# TAB 2: DALL·E images (optional)
 # ---------------------------
 with tab2:
-    st.info("Add your next module here. You can read Tab 1 output via `st.session_state['notes_json']`.")
-    if "notes_json" in st.session_state:
-        st.write("Detected JSON from Tab 1:")
-        st.json(st.session_state["notes_json"])
+    st.info("Generate images from prompts s1alt1..s6alt1 in the JSON from Tab 1. No S3 uploads — just preview and download.")
+    if "notes_json" not in st.session_state:
+        st.warning("Run Tab 1 first to produce JSON with image prompts.")
+    else:
+        j = st.session_state["notes_json"]
+        size = st.selectbox("Image size", ["1024x1024", "512x512", "256x256"], index=0)
+        go = st.button("Generate Images", disabled=not (AZURE_DALLE_KEY and AZURE_DALLE_ENDPOINT), type="primary")
+
+        if go:
+            images = []
+            with st.spinner("Generating images with Azure DALL·E 3…"):
+                for i in range(1, 7):
+                    prompt = j.get(f"s{i}alt1", "").strip()
+                    if not prompt:
+                        images.append(None)
+                        continue
+                    img_bytes = call_azure_dalle(prompt, size=size)
+                    images.append(img_bytes)
+
+            st.divider()
+            for i, img_bytes in enumerate(images, start=1):
+                st.subheader(f"Slide {i}")
+                if img_bytes:
+                    img = Image.open(BytesIO(img_bytes)).convert("RGB")
+                    st.image(img, use_column_width=True)
+                    st.download_button(
+                        "Download image",
+                        data=img_bytes,
+                        file_name=f"slide{i}.jpg",
+                        mime="image/jpeg",
+                        key=f"dl_img_{i}"
+                    )
+                else:
+                    st.warning("No image for this slide.")
 
 # ---------------------------
 # TAB 3: Placeholder
 # ---------------------------
 with tab3:
-    st.info("Another placeholder tab for future features.")
+    st.info("Placeholder tab for your next feature. You can reuse `st.session_state['notes_json']` here as well.")
     if "notes_json" in st.session_state:
-        st.write("You can reuse the same JSON here too:")
         st.json(st.session_state["notes_json"])
 
 st.markdown("---")
-st.caption("Tip: Add your Azure keys to `.streamlit/secrets.toml` when running locally.")
+st.caption("Tip: Never commit real keys. Use `.streamlit/secrets.toml` or Streamlit Cloud secrets.")
