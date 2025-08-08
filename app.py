@@ -1,64 +1,121 @@
+# app.py
+# ------------------------------------------------------------
+# Streamlit: Notes Image → GPT JSON → Safe DALL·E Images → S3 → JSON download
+# Tab 1 only (ready for GitHub). Uses st.secrets for credentials.
+# ------------------------------------------------------------
+import os
+import io
+import re
 import json
+import time
 import base64
-from datetime import datetime
-from io import BytesIO
-from typing import Optional
-
+import string
+import random
 import requests
-import streamlit as st
+import boto3
+from io import BytesIO
+from datetime import datetime, timezone
 from PIL import Image
+import streamlit as st
 
 # ---------------------------
-# Streamlit page config
+# Page config
 # ---------------------------
 st.set_page_config(
-    page_title="Notes → AMP Web Story",
+    page_title="Notes → JSON (GPT + DALL·E + S3)",
     page_icon="🧠",
     layout="centered"
 )
-
-st.title("🧠 Notes → AMP Web Story")
-st.caption("Tab 1: Notes → JSON (Azure OpenAI Vision). Tab 2: optional DALL·E images. Tab 3: your next feature.")
+st.title("🧠 Notes → JSON (GPT + DALL·E + S3)")
+st.caption("Upload a notes image, get a structured JSON, safe image prompts, DALL·E images to S3, and download JSON.")
 
 # ---------------------------
-# Secrets / Config (st.secrets)
+# Secrets / Config
 # ---------------------------
-def get_secret(name: str, default: str = "") -> str:
+def get_secret(key, default=None):
     try:
-        return st.secrets[name]
+        return st.secrets[key]
     except Exception:
         return default
 
-# Chat/Vision
 AZURE_API_KEY     = get_secret("AZURE_API_KEY")
-AZURE_ENDPOINT    = get_secret("AZURE_ENDPOINT")  # e.g., https://<resource>.openai.azure.com
+AZURE_ENDPOINT    = get_secret("AZURE_ENDPOINT")
 AZURE_DEPLOYMENT  = get_secret("AZURE_DEPLOYMENT", "gpt-4")
 AZURE_API_VERSION = get_secret("AZURE_API_VERSION", "2024-08-01-preview")
 
-# DALL·E 3
-# If these are blank, we auto-fallback to the Chat/Vision endpoint/key (same resource).
-# If you paste a FULL Images URL (including /images/generations and ?api-version=...), we'll use it as-is.
-AZURE_DALLE_KEY         = get_secret("AZURE_DALLE_KEY", "")
-AZURE_DALLE_ENDPOINT    = get_secret("AZURE_DALLE_ENDPOINT", "")  # can be a full URL or just the host
-AZURE_DALLE_DEPLOYMENT  = get_secret("AZURE_DALLE_DEPLOYMENT", "dall-e-3")
-AZURE_DALLE_API_VERSION = get_secret("AZURE_DALLE_API_VERSION", "2024-02-01")
+DALE_ENDPOINT     = get_secret("DALE_ENDPOINT")  # full URL for images/generations endpoint
+DAALE_KEY         = get_secret("DAALE_KEY")
 
-if not (AZURE_API_KEY and AZURE_ENDPOINT and AZURE_DEPLOYMENT and AZURE_API_VERSION):
-    st.warning(
-        "⚙️ Configure your Azure Chat/Vision secrets in `.streamlit/secrets.toml` → "
-        "AZURE_API_KEY, AZURE_ENDPOINT, AZURE_DEPLOYMENT, AZURE_API_VERSION"
-    )
+AWS_ACCESS_KEY    = get_secret("AWS_ACCESS_KEY")
+AWS_SECRET_KEY    = get_secret("AWS_SECRET_KEY")
+AWS_REGION        = get_secret("AWS_REGION", "ap-south-1")
+AWS_BUCKET        = get_secret("AWS_BUCKET")
+S3_PREFIX         = get_secret("S3_PREFIX", "media")
+DISPLAY_BASE      = get_secret("DISPLAY_BASE", "https://media.example.com")
+DEFAULT_ERROR_IMAGE = get_secret("DEFAULT_ERROR_IMAGE", "https://media.example.com/default-error.jpg")
+
+# Optional Azure Content Safety (text)
+ACS_ENDPOINT           = get_secret("ACS_ENDPOINT")  # e.g., https://<your-cs>.cognitiveservices.azure.com
+ACS_KEY                = get_secret("ACS_KEY")
+ACS_API_VERSION        = get_secret("ACS_API_VERSION", "2023-10-01")
+ACS_SEVERITY_THRESHOLD = int(get_secret("ACS_SEVERITY_THRESHOLD", 2))
+
+# Fast validation
+missing = []
+for k in ["AZURE_API_KEY", "AZURE_ENDPOINT", "AZURE_DEPLOYMENT", "DAALE_KEY", "AWS_ACCESS_KEY", "AWS_SECRET_KEY", "AWS_BUCKET"]:
+    if not get_secret(k):
+        missing.append(k)
+if not DALE_ENDPOINT:
+    missing.append("DALE_ENDPOINT (full Azure DALL·E images/generations URL)")
+if missing:
+    st.warning("Add these secrets in `.streamlit/secrets.toml`: " + ", ".join(missing))
 
 # ---------------------------
-# Prompts & helpers (Chat/Vision)
+# Tabs (Tab 1 only)
 # ---------------------------
-SYSTEM_PROMPT = """
+tab1, = st.tabs(["Tab 1 — Notes → JSON"])
+
+with tab1:
+    uploaded_img = st.file_uploader("Upload a notes image (JPG/PNG)", type=["jpg", "jpeg", "png"])
+    run = st.button("Generate JSON")
+
+    if run:
+        if not uploaded_img:
+            st.error("Please upload an image first.")
+            st.stop()
+
+        # Preview
+        try:
+            img = Image.open(uploaded_img).convert("RGB")
+            st.image(img, caption="Uploaded image", use_container_width=True)
+        except Exception as e:
+            st.error(f"Could not open image: {e}")
+            st.stop()
+
+        # Convert to base64
+        img_bytes = uploaded_img.read() if hasattr(uploaded_img, "read") else None
+        if img_bytes is None:
+            uploaded_img.seek(0)
+            img_bytes = uploaded_img.read()
+        base64_img = base64.b64encode(img_bytes).decode("utf-8")
+
+        # ------------ Azure Chat (vision) to get JSON ------------
+        system_prompt = """
 You are a teaching assistant. The student has uploaded a notes image.
-1. Extract a catchy title → storytitle
-2. Summarise into 5 slides (s2paragraph1 to s6paragraph1), each ≤ 400 characters
-3. For each (including title), generate vivid, multi-color vector-style DALL·E image prompts (s1alt1 to s6alt1)
-Respond in this exact JSON format (no extra text):
 
+Your job:
+1) Extract a short and catchy title → storytitle
+2) Summarise the whole content into 5 slides (s2paragraph1..s6paragraph1), each ≤ 400 characters.
+3) For each paragraph (including the title), write a DALL·E prompt (s1alt1..s6alt1) for a 1024x1024 flat vector illustration: bright colors, clean lines, no text/captions/logos.
+
+SAFETY & POSITIVITY RULES (MANDATORY):
+- If the source includes hate, harassment, violence, adult content, self-harm, illegal acts, or extremist symbols, DO NOT reproduce them.
+- Reinterpret into a positive, inclusive, family-friendly, educational scene (unity, learning, empathy, community, peace).
+- Replace any hateful/violent symbol with abstract shapes, nature, or neutral motifs.
+- Never include real people’s likeness or sensitive groups in a negative way.
+- Avoid slogans, gestures, flags, trademarks, or captions. Absolutely NO TEXT in the image.
+
+Respond strictly in this JSON format:
 {
   "storytitle": "...",
   "s2paragraph1": "...",
@@ -74,299 +131,272 @@ Respond in this exact JSON format (no extra text):
   "s6alt1": "..."
 }
 """
+        headers = {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
+        chat_url = f"{AZURE_ENDPOINT}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
+        payload = {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_img}"}}
+                ]}
+            ],
+            "temperature": 0.7,
+            "max_tokens": 1000
+        }
 
-def make_vision_payload(b64_image: str):
-    return {
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
-                ]
+        with st.spinner("Generating structured JSON from the image…"):
+            res = requests.post(chat_url, headers=headers, json=payload, timeout=120)
+            if res.status_code != 200:
+                st.error(f"Azure Chat error: {res.status_code} — {res.text[:300]}")
+                st.stop()
+            reply = res.json()["choices"][0]["message"]["content"]
+            # Parse JSON (with fallback extraction)
+            try:
+                try:
+                    result = json.loads(reply)
+                except Exception:
+                    m = re.search(r"\{[\s\S]*\}", reply)
+                    result = json.loads(m.group(0)) if m else None
+            except Exception as e:
+                st.error(f"Model did not return valid JSON: {e}\n\nRaw:\n{reply[:500]}")
+                st.stop()
+
+        st.success("Structured JSON created.")
+        st.json(result, expanded=False)
+
+        # ------------ Optional: Azure Content Safety (text) ------------
+        def content_safety_is_risky(text: str) -> bool:
+            """Returns True if text crosses severity threshold on any category."""
+            if not text or not ACS_ENDPOINT or not ACS_KEY:
+                return False
+            endpoint = f"{ACS_ENDPOINT}/contentsafety/text:analyze?api-version={ACS_API_VERSION}"
+            headers_cs = {
+                "Ocp-Apim-Subscription-Key": ACS_KEY,
+                "Content-Type": "application/json"
             }
-        ],
-        "temperature": 0.7,
-        "max_tokens": 1200
-    }
+            payload_cs = {"text": text}
+            try:
+                r = requests.post(endpoint, headers=headers_cs, json=payload_cs, timeout=30)
+                if r.status_code != 200:
+                    st.info(f"Content Safety API non-200: {r.status_code}")
+                    return False
+                data = r.json()
+                severities = []
+                if isinstance(data, dict):
+                    if "categoriesAnalysis" in data and isinstance(data["categoriesAnalysis"], list):
+                        for cat in data["categoriesAnalysis"]:
+                            sev = cat.get("severity")
+                            if isinstance(sev, (int, float)):
+                                severities.append(int(sev))
+                    for key in ("hate", "violence", "sexual", "selfHarm"):
+                        if key in data and isinstance(data[key], dict):
+                            sev = data[key].get("severity")
+                            if isinstance(sev, (int, float)):
+                                severities.append(int(sev))
+                max_sev = max(severities) if severities else 0
+                return max_sev >= ACS_SEVERITY_THRESHOLD
+            except Exception as e:
+                st.info(f"Content Safety check failed: {e}")
+                return False
 
-def call_azure_chat(payload: dict) -> requests.Response:
-    url = f"{AZURE_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions"
-    params = {"api-version": AZURE_API_VERSION}
-    headers = {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
-    return requests.post(url, headers=headers, params=params, json=payload, timeout=60)
-
-def try_parse_json(text: str):
-    # strict
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    # strip code fences
-    t = text.strip()
-    if t.startswith("```"):
-        t = t.strip("`")
-        if "\n" in t:
-            t = t.split("\n", 1)[1]
-    try:
-        return json.loads(t)
-    except Exception:
-        pass
-    # first {...}
-    import re
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except Exception:
-            return None
-    return None
-
-def generate_seo_metadata(storytitle: str, slides: list):
-    seo_prompt = f"""
-Generate SEO metadata for a web story:
-
-Title: {storytitle}
-Slides:
-- {slides[0] if len(slides) > 0 else ""}
-- {slides[1] if len(slides) > 1 else ""}
-- {slides[2] if len(slides) > 2 else ""}
-- {slides[3] if len(slides) > 3 else ""}
-- {slides[4] if len(slides) > 4 else ""}
-
-Respond in JSON:
-{{"metadescription": "...", "metakeywords": "..."}}
-"""
-    payload = {
-        "messages": [
-            {"role": "system", "content": "You are an expert SEO assistant. Reply with JSON only."},
-            {"role": "user", "content": seo_prompt}
-        ],
-        "temperature": 0.4,
-        "max_tokens": 300
-    }
-    resp = call_azure_chat(payload)
-    if resp.status_code == 200:
-        raw = resp.json()["choices"][0]["message"]["content"]
-        parsed = try_parse_json(raw)
-        if isinstance(parsed, dict):
-            return parsed.get("metadescription", ""), parsed.get("metakeywords", "")
-    return "Explore this insightful story.", "web story, learning"
-
-# ---------------------------
-# DALL·E helpers (Images)
-# ---------------------------
-def _effective_dalle_key() -> str:
-    # Reuse Chat key if Images key not provided
-    return AZURE_DALLE_KEY or AZURE_API_KEY or ""
-
-def _effective_dalle_endpoint() -> str:
-    # Use Images endpoint if provided; else fallback to Chat endpoint
-    return (AZURE_DALLE_ENDPOINT or AZURE_ENDPOINT or "").rstrip("/")
-
-def _is_full_images_url(url: str) -> bool:
-    """True if the provided endpoint already includes /images/generations (possibly with ?api-version=...)."""
-    if not url:
-        return False
-    u = url.lower()
-    return "images/generations" in u
-
-def _images_config_ok() -> bool:
-    return bool(_effective_dalle_endpoint() and _effective_dalle_key())
-
-def call_azure_dalle(prompt: str, size: str = "1024x1024") -> Optional[bytes]:
-    """
-    Azure OpenAI Images API (DALL·E 3) -> raw image bytes.
-
-    Supports TWO modes for AZURE_DALLE_ENDPOINT:
-      1) FULL URL pasted (contains '/images/generations' and maybe '?api-version=...') → use as-is.
-      2) HOST only (e.g., https://<resource>.openai.azure.com) → we append the standard path and api-version.
-    """
-    endpoint = _effective_dalle_endpoint()
-    key = _effective_dalle_key()
-
-    if not _images_config_ok():
-        st.error("Missing DALL·E config. Provide endpoint and key (or rely on Chat/Vision fallbacks).")
-        return None
-
-    headers = {"Content-Type": "application/json", "api-key": key}
-    payload = {"prompt": prompt, "n": 1, "size": size}
-
-    if _is_full_images_url(endpoint):
-        # Use EXACT endpoint as given (no extra path/params)
-        url = endpoint  # already includes /images/generations and maybe ?api-version=...
-        r = requests.post(url, headers=headers, json=payload, timeout=90)
-    else:
-        # Build standard Images URL
-        url = f"{endpoint}/openai/deployments/{AZURE_DALLE_DEPLOYMENT}/images/generations"
-        params = {"api-version": AZURE_DALLE_API_VERSION}
-        r = requests.post(url, headers=headers, params=params, json=payload, timeout=90)
-
-    if r.status_code != 200:
-        st.error(
-            f"DALL·E error {r.status_code} from {url}\n"
-            f"(If you pasted a full URL, we are using it verbatim.)\n"
-            f"body: {r.text[:500]}"
+        # ------------ Prompt Sanitizer ------------
+        SAFE_FALLBACK = (
+            "A joyful, abstract geometric illustration symbolizing unity and learning — "
+            "soft shapes, harmonious gradients, friendly silhouettes, "
+            "no text, no logos, no brands, no real persons, family-friendly, "
+            "flat vector style, bright colors."
         )
-        return None
 
-    try:
-        img_url = r.json()["data"][0]["url"]
-    except Exception:
-        st.error(f"Unexpected Images response: {r.text[:500]}")
-        return None
+        def sanitize_prompt(original_prompt: str) -> str:
+            """Rewrite any risky prompt into a safe, positive, family-friendly version."""
+            sanitize_payload = {
+                "messages": [
+                    {"role": "system", "content": (
+                        "Rewrite image prompts to be safe, positive, inclusive, and family-friendly. "
+                        "Remove any hate/harassment/violence/adult/illegal/extremist content, slogans, logos, "
+                        "or real-person likenesses. Keep the core educational idea and flat vector art style. "
+                        "Return ONLY the rewritten prompt text."
+                    )},
+                    {"role": "user", "content": f"Original prompt:\n{original_prompt}\n\nRewritten safe prompt:"}
+                ],
+                "temperature": 0.2,
+                "max_tokens": 300
+            }
+            try:
+                sr = requests.post(chat_url, headers=headers, json=sanitize_payload, timeout=60)
+                if sr.status_code == 200:
+                    return sr.json()["choices"][0]["message"]["content"].strip()
+            except Exception as e:
+                st.info(f"Sanitizer call failed; using local guards: {e}")
 
-    try:
-        return requests.get(img_url, timeout=60).content
-    except Exception as e:
-        st.error(f"Failed to download generated image: {e}")
-        return None
+            # Local guardrails if service fails
+            return (original_prompt +
+                    "\nFlat vector illustration, bright colors, no text, no logos, no brands, "
+                    "no real persons, family-friendly, inclusive, peaceful.")
 
-# =========================================================
-# Tabs
-# =========================================================
-tab1, tab2, tab3 = st.tabs([
-    "Tab 1 • Notes → JSON",
-    "Tab 2 • DALL·E images (optional)",
-    "Tab 3 • (your next feature)"
-])
+        # ------------ DALL·E + S3 upload ------------
+        def generate_and_resize_images(result_json: dict) -> dict:
+            if not all([DALE_ENDPOINT, DAALE_KEY, AWS_ACCESS_KEY, AWS_SECRET_KEY, AWS_BUCKET]):
+                st.error("Missing DALL·E and/or AWS S3 secrets.")
+                return {**result_json}
 
-# ---------------------------
-# TAB 1: Notes → JSON
-# ---------------------------
-with tab1:
-    st.subheader("1) Upload your notes image")
-    img_file = st.file_uploader("JPG/PNG only", type=["jpg", "jpeg", "png"], key="notes_img_uploader")
+            s3 = boto3.client(
+                "s3",
+                aws_access_key_id=AWS_ACCESS_KEY,
+                aws_secret_access_key=AWS_SECRET_KEY,
+                region_name=AWS_REGION
+            )
 
-    st.subheader("2) Optional fields")
-    coachingname = st.text_input("Coaching name (optional)", value="", key="coaching_name_tab1")
-    add_seo = st.checkbox("Add SEO metadata", value=True, key="add_seo_tab1")
+            slug = (
+                result_json["storytitle"]
+                .lower()
+                .replace(" ", "-")
+                .replace(":", "")
+                .replace(".", "")
+            )
+            final_json = {k: result_json[k] for k in result_json}
 
-    run = st.button("Generate JSON", type="primary", disabled=not img_file or not AZURE_API_KEY, key="run_tab1")
+            progress = st.progress(0, text="Generating images…")
+            for i in range(1, 7):
+                raw_prompt = result_json.get(f"s{i}alt1", "")
+                safe_prompt = raw_prompt
 
-    if run and img_file:
-        try:
-            # Read & preview
-            image = Image.open(img_file).convert("RGB")
-            st.image(image, caption="Uploaded", use_column_width=True)
+                # Pre-check with Content Safety (if configured)
+                if content_safety_is_risky(safe_prompt):
+                    safe_prompt = sanitize_prompt(safe_prompt)
+                    if content_safety_is_risky(safe_prompt):
+                        st.info(f"Slide {i}: sanitized prompt still risky → using fallback.")
+                        safe_prompt = SAFE_FALLBACK
 
-            # Base64 encode
-            buf = BytesIO()
-            image.save(buf, format="JPEG")
-            b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                payload = {"prompt": safe_prompt, "n": 1, "size": "1024x1024"}
+                headers_dalle = {"Content-Type": "application/json", "api-key": DAALE_KEY}
 
-            # Vision call
-            with st.spinner("Calling Azure OpenAI (Vision)…"):
-                resp = call_azure_chat(make_vision_payload(b64))
-
-            if resp.status_code != 200:
-                st.error(f"Azure error {resp.status_code}: {resp.text[:400]}")
-            else:
-                content = resp.json()["choices"][0]["message"]["content"]
-                parsed = try_parse_json(content)
-                if not isinstance(parsed, dict):
-                    st.error("Model did not return valid JSON. Check your deployment/model settings.")
-                else:
-                    if coachingname.strip():
-                        parsed["coachingname"] = coachingname.strip()
-
-                    if add_seo:
-                        slides = [
-                            parsed.get("s2paragraph1", ""),
-                            parsed.get("s3paragraph1", ""),
-                            parsed.get("s4paragraph1", ""),
-                            parsed.get("s5paragraph1", ""),
-                            parsed.get("s6paragraph1", ""),
-                        ]
-                        with st.spinner("Generating SEO metadata…"):
-                            meta_desc, meta_keywords = generate_seo_metadata(parsed.get("storytitle", ""), slides)
-                        parsed["metadescription"] = meta_desc
-                        parsed["metakeywords"] = meta_keywords
-
-                    # Save to session for other tabs
-                    st.session_state["notes_json"] = parsed
-
-                    # Show + download
-                    st.subheader("✅ Structured JSON")
-                    st.json(parsed)
-
-                    fname_slug = parsed.get("storytitle", "webstory").replace(" ", "_").replace(":", "").lower()
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    dl_name = f"{fname_slug}_{ts}.json"
-                    st.download_button(
-                        label="⬇️ Download JSON",
-                        data=json.dumps(parsed, ensure_ascii=False, indent=2).encode("utf-8"),
-                        file_name=dl_name,
-                        mime="application/json",
-                        key="download_json_tab1"
-                    )
-
-        except Exception as e:
-            st.exception(e)
-
-    if "notes_json" in st.session_state and not run:
-        with st.expander("Last generated JSON (from session)", expanded=False):
-            st.json(st.session_state["notes_json"])
-
-# ---------------------------
-# TAB 2: DALL·E images (optional)
-# ---------------------------
-with tab2:
-    st.info("Generate images from prompts s1alt1..s6alt1 in the JSON from Tab 1. No S3 uploads — just preview and download.")
-    # Debug: show what URL we'll call
-    with st.expander("Images API config (debug)"):
-        eff_ep = _effective_dalle_endpoint()
-        st.write({
-            "endpoint_provided": AZURE_DALLE_ENDPOINT,
-            "endpoint_used": eff_ep,
-            "treated_as_full_url": _is_full_images_url(eff_ep),
-            "deployment": AZURE_DALLE_DEPLOYMENT,
-            "api_version": AZURE_DALLE_API_VERSION,
-            "key_present": bool(_effective_dalle_key()),
-        })
-
-    if "notes_json" not in st.session_state:
-        st.warning("Run Tab 1 first to produce JSON with image prompts.")
-    else:
-        j = st.session_state["notes_json"]
-        size = st.selectbox("Image size", ["1024x1024", "512x512", "256x256"], index=0)
-        ready = _images_config_ok()
-        go = st.button("Generate Images", disabled=not ready, type="primary")
-
-        if go:
-            images = []
-            with st.spinner("Generating images with Azure DALL·E 3…"):
-                for i in range(1, 7):
-                    prompt = j.get(f"s{i}alt1", "").strip()
-                    if not prompt:
-                        images.append(None)
+                image_url = None
+                for attempt in range(3):
+                    r = requests.post(DALE_ENDPOINT, headers=headers_dalle, json=payload, timeout=120)
+                    if r.status_code == 200:
+                        try:
+                            image_url = r.json()["data"][0]["url"]
+                            break
+                        except Exception as e:
+                            st.info(f"Slide {i}: unexpected DALL·E response format: {e}")
+                            break
+                    elif r.status_code in (400, 403):
+                        st.info(f"Slide {i}: DALL·E blocked, retrying with fallback.")
+                        payload = {"prompt": SAFE_FALLBACK, "n": 1, "size": "1024x1024"}
                         continue
-                    img_bytes = call_azure_dalle(prompt, size=size)
-                    images.append(img_bytes)
+                    elif r.status_code == 429:
+                        st.info(f"Slide {i}: rate-limited, waiting 10s…")
+                        time.sleep(10)
+                    else:
+                        st.info(f"Slide {i}: DALL·E error {r.status_code} — {r.text[:200]}")
+                        break
 
-            st.divider()
-            for i, img_bytes in enumerate(images, start=1):
-                st.subheader(f"Slide {i}")
-                if img_bytes:
-                    img = Image.open(BytesIO(img_bytes)).convert("RGB")
-                    st.image(img, use_column_width=True)
-                    st.download_button(
-                        "Download image",
-                        data=img_bytes,
-                        file_name=f"slide{i}.jpg",
-                        mime="image/jpeg",
-                        key=f"dl_img_{i}"
-                    )
+                if image_url:
+                    try:
+                        img_data = requests.get(image_url, timeout=120).content
+                        im = Image.open(BytesIO(img_data)).convert("RGB")
+                        im = im.resize((720, 1200))
+                        buffer = BytesIO()
+                        im.save(buffer, format="JPEG")
+                        buffer.seek(0)
+                        key = f"{S3_PREFIX.rstrip('/')}/{slug}/slide{i}.jpg"
+                        s3.upload_fileobj(buffer, AWS_BUCKET, key, ExtraArgs={"ContentType": "image/jpeg", "ACL": "public-read"})
+                        final_json[f"s{i}image1"] = f"{DISPLAY_BASE.rstrip('/')}/{key}"
+                    except Exception as e:
+                        st.info(f"Slide {i}: upload failed → {e}")
+                        final_json[f"s{i}image1"] = DEFAULT_ERROR_IMAGE
                 else:
-                    st.warning("No image for this slide.")
+                    final_json[f"s{i}image1"] = DEFAULT_ERROR_IMAGE
 
-# ---------------------------
-# TAB 3: Placeholder
-# ---------------------------
-with tab3:
-    st.info("Placeholder tab for your next feature. You can reuse `st.session_state['notes_json']` here as well.")
-    if "notes_json" in st.session_state:
-        st.json(st.session_state["notes_json"])
+                progress.progress(i/6.0, text=f"Generating images… ({i}/6)")
 
-st.markdown("---")
-st.caption("Tip: never commit real keys. Use `.streamlit/secrets.toml` or Streamlit Cloud secrets.")
+            # Portrait cover from s1image1
+            try:
+                s1_url = final_json.get("s1image1")
+                if s1_url and s1_url != DEFAULT_ERROR_IMAGE:
+                    img_data = requests.get(s1_url, timeout=120).content
+                    im = Image.open(BytesIO(img_data)).convert("RGB")
+                    im = im.resize((640, 853))
+                    buf = BytesIO()
+                    im.save(buf, format="JPEG")
+                    buf.seek(0)
+                    portrait_key = f"{S3_PREFIX.rstrip('/')}/{slug}/portrait_cover.jpg"
+                    s3.upload_fileobj(buf, AWS_BUCKET, portrait_key, ExtraArgs={"ContentType": "image/jpeg", "ACL": "public-read"})
+                    final_json["potraitcoverurl"] = f"{DISPLAY_BASE.rstrip('/')}/{portrait_key}"
+                else:
+                    final_json["potraitcoverurl"] = DEFAULT_ERROR_IMAGE
+            except Exception as e:
+                st.info(f"Portrait cover generation failed: {e}")
+                final_json["potraitcoverurl"] = DEFAULT_ERROR_IMAGE
+
+            progress.empty()
+            return final_json
+
+        # ------------ SEO metadata ------------
+        def generate_seo_metadata(result_json: dict):
+            seo_prompt = f"""
+Generate SEO metadata for a web story with the following title and slide summaries.
+
+Title: {result_json.get("storytitle","")}
+Slides:
+- {result_json.get("s2paragraph1","")}
+- {result_json.get("s3paragraph1","")}
+- {result_json.get("s4paragraph1","")}
+- {result_json.get("s5paragraph1","")}
+- {result_json.get("s6paragraph1","")}
+
+Respond strictly in this JSON format:
+{{
+  "metadescription": "...",
+  "metakeywords": "keyword1, keyword2, ..."
+}}
+"""
+            payload_seo = {
+                "messages": [
+                    {"role": "system", "content": "You are an expert SEO assistant."},
+                    {"role": "user", "content": seo_prompt}
+                ],
+                "temperature": 0.5,
+                "max_tokens": 300
+            }
+            try:
+                r = requests.post(chat_url, headers=headers, json=payload_seo, timeout=60)
+                if r.status_code != 200:
+                    return "Explore this insightful story.", "web story, inspiration"
+                content = r.json()["choices"][0]["message"]["content"]
+                try:
+                    seo_data = json.loads(content)
+                except Exception:
+                    m = re.search(r"\{[\s\S]*\}", content)
+                    seo_data = json.loads(m.group(0)) if m else {}
+                return seo_data.get("metadescription", "Explore this insightful story."), \
+                       seo_data.get("metakeywords", "web story, inspiration")
+            except Exception:
+                return "Explore this insightful story.", "web story, inspiration"
+
+        # ------------ Run images + SEO + save JSON ------------
+        with st.spinner("Generating DALL·E images and uploading to S3…"):
+            final_json = generate_and_resize_images(result)
+
+        with st.spinner("Generating SEO metadata…"):
+            meta_desc, meta_keywords = generate_seo_metadata(result)
+            final_json["metadescription"] = meta_desc
+            final_json["metakeywords"] = meta_keywords
+
+        # Save JSON to memory, show + download
+        safe_title = result["storytitle"].replace(" ", "_").replace(":", "").lower()
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_name = f"{safe_title}_{ts}.json"
+        buf = io.StringIO()
+        json.dump(final_json, buf, ensure_ascii=False, indent=2)
+        content_str = buf.getvalue()
+        st.success("✅ JSON ready")
+        st.json(final_json, expanded=False)
+        st.download_button(
+            "⬇️ Download JSON",
+            data=content_str.encode("utf-8"),
+            file_name=out_name,
+            mime="application/json"
+        )
+
