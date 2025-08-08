@@ -314,7 +314,7 @@ Respond strictly in this JSON format:
                         im.save(buffer, format="JPEG")
                         buffer.seek(0)
                         key = f"{S3_PREFIX.rstrip('/')}/{slug}/slide{i}.jpg"
-                        s3.upload_fileobj(buffer, AWS_BUCKET, key, ExtraArgs={"ContentType": "image/jpeg", "ACL": "public-read"})
+                        s3.upload_fileobj(buffer, AWS_BUCKET, key, ExtraArgs={"ContentType": "image/jpeg"})
                         final_json[f"s{i}image1"] = f"{DISPLAY_BASE.rstrip('/')}/{key}"
                     except Exception as e:
                         st.info(f"Slide {i}: upload failed → {e}")
@@ -335,7 +335,7 @@ Respond strictly in this JSON format:
                     im.save(buf, format="JPEG")
                     buf.seek(0)
                     portrait_key = f"{S3_PREFIX.rstrip('/')}/{slug}/portrait_cover.jpg"
-                    s3.upload_fileobj(buf, AWS_BUCKET, portrait_key, ExtraArgs={"ContentType": "image/jpeg", "ACL": "public-read"})
+                    s3.upload_fileobj(buf, AWS_BUCKET, portrait_key, ExtraArgs={"ContentType": "image/jpeg"})
                     final_json["potraitcoverurl"] = f"{DISPLAY_BASE.rstrip('/')}/{portrait_key}"
                 else:
                     final_json["potraitcoverurl"] = DEFAULT_ERROR_IMAGE
