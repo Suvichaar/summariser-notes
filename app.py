@@ -1,7 +1,7 @@
 # app.py
 # ------------------------------------------------------------
-# Tab 1: Notes Image → GPT JSON (same language as image) → Safe DALL·E Images → S3 → JSON (CDN resized URLs)
-# Tab 2: JSON → Azure Speech TTS MP3 → S3 → add audio fields to JSON (voice auto-picked by language)
+# Tab 1: Notes Image → GPT JSON (multilingual) → Safe DALL·E Images → S3 → JSON (CDN resized URLs)
+# Tab 2: JSON → Azure Speech TTS MP3 (voice chosen by detected language) → S3 → add audio fields to JSON
 # Tab 3: Fill multiple HTML templates using JSON from Tab 1/2 (or upload)
 # ------------------------------------------------------------
 import os
@@ -28,7 +28,7 @@ st.set_page_config(
     layout="centered"
 )
 st.title("🧠 Suvichaar Tools")
-st.caption("Tab 1: Notes → JSON + Images | Tab 2: JSON → TTS MP3 | Tab 3: JSON → HTML (fill templates) — now language-aware")
+st.caption("Tab 1: Notes → JSON + Images | Tab 2: JSON → TTS MP3 | Tab 3: JSON → HTML (fill templates)")
 
 # ---------------------------
 # Secrets / Config
@@ -65,7 +65,7 @@ DEFAULT_ERROR_IMAGE = get_secret("DEFAULT_ERROR_IMAGE", "https://media.suvichaar
 # Azure Speech (TTS)
 AZURE_SPEECH_KEY     = get_secret("AZURE_SPEECH_KEY")
 AZURE_SPEECH_REGION  = get_secret("AZURE_SPEECH_REGION", "eastus")
-VOICE_NAME_DEFAULT   = get_secret("VOICE_NAME", "hi-IN-AaravNeural")  # fallback if language not recognized
+VOICE_NAME_DEFAULT   = get_secret("VOICE_NAME", "hi-IN-AaravNeural")
 
 # CDN for audio files (served via CloudFront)
 CDN_BASE             = get_secret("CDN_BASE", "https://cdn.suvichaar.org/")
@@ -131,6 +131,20 @@ def sanitize_prompt(chat_url: str, headers: dict, original_prompt: str) -> str:
             "\nFlat vector illustration, bright colors, no text, no logos, no brands, "
             "no real persons, family-friendly, inclusive, peaceful.")
 
+def robust_parse_model_json(raw_reply: str):
+    """Parse model reply into a dict or return None."""
+    parsed = None
+    try:
+        parsed = json.loads(raw_reply)
+    except Exception:
+        m = re.search(r"\{[\s\S]*\}", raw_reply)
+        if m:
+            try:
+                parsed = json.loads(m.group(0))
+            except Exception:
+                parsed = None
+    return parsed if isinstance(parsed, dict) else None
+
 def generate_and_upload_images(result_json: dict) -> dict:
     """Generate DALL·E images, upload originals to S3, return CDN resized URLs in JSON."""
     if not all([DALE_ENDPOINT, DAALE_KEY, AWS_ACCESS_KEY, AWS_SECRET_KEY, AWS_BUCKET]):
@@ -145,8 +159,11 @@ def generate_and_upload_images(result_json: dict) -> dict:
     )
 
     slug = (
-        result_json.get("storytitle", "story")
-        .lower().replace(" ", "-").replace(":", "").replace(".", "")
+        (result_json.get("storytitle") or "story")
+        .lower()
+        .replace(" ", "-")
+        .replace(":", "")
+        .replace(".", "")
     )
     out = {k: result_json[k] for k in result_json}
     first_slide_key = None
@@ -217,13 +234,11 @@ def generate_and_upload_images(result_json: dict) -> dict:
 
     return out
 
-def generate_seo_metadata(chat_url: str, headers: dict, result_json: dict):
-    lang_hint = result_json.get("language", "").strip()
-    lang_line = f"Write the metadata in this language: {lang_hint}." if lang_hint else "Write the metadata in the same language as the slides."
-
+def generate_seo_metadata(chat_url: str, headers: dict, result_json: dict, lang_code: str):
+    """Ask the model for SEO metadata in the detected language."""
+    lang_code = (lang_code or "").strip() or "auto"
     seo_prompt = f"""
-Generate SEO metadata for a web story with the following title and slide summaries.
-{lang_line}
+Generate SEO metadata for a web story. Write ALL outputs in this language: {lang_code}
 
 Title: {result_json.get("storytitle","")}
 Slides:
@@ -241,7 +256,7 @@ Respond strictly in this JSON format:
 """
     payload_seo = {
         "messages": [
-            {"role": "system", "content": "You are an expert SEO assistant. Keep language consistent with the provided text."},
+            {"role": "system", "content": "You are an expert SEO assistant. Answer ONLY with valid JSON."},
             {"role": "user", "content": seo_prompt}
         ],
         "temperature": 0.5,
@@ -252,31 +267,39 @@ Respond strictly in this JSON format:
         if r.status_code != 200:
             return "Explore this insightful story.", "web story, inspiration"
         content = r.json()["choices"][0]["message"]["content"]
-        try:
-            seo_data = json.loads(content)
-        except Exception:
-            m = re.search(r"\{[\s\S]*\}", content)
-            seo_data = json.loads(m.group(0)) if m else {}
-        return seo_data.get("metadescription", "Explore this insightful story."), \
-               seo_data.get("metakeywords", "web story, inspiration")
+        data = robust_parse_model_json(content) or {}
+        return data.get("metadescription", "Explore this insightful story."), \
+               data.get("metakeywords", "web story, inspiration")
     except Exception:
         return "Explore this insightful story.", "web story, inspiration"
 
-def pick_voice_for_language(lang_code: str) -> str:
-    """Pick a sensible Azure neural voice for the detected language; fallback to VOICE_NAME_DEFAULT."""
+def pick_voice_for_language(lang_code: str, default_voice: str) -> str:
+    """Map detected language → Azure voice name."""
     if not lang_code:
-        return VOICE_NAME_DEFAULT
+        return default_voice
     l = lang_code.lower()
-    # Hindi
+    # Basic examples; customize for your needs
     if l.startswith("hi"):
         return "hi-IN-AaravNeural"
-    # Indian English vs General English
     if l.startswith("en-in"):
         return "en-IN-NeerjaNeural"
     if l.startswith("en"):
         return "en-US-AriaNeural"
-    # Fallback to configured default
-    return VOICE_NAME_DEFAULT
+    if l.startswith("bn"):
+        return "bn-IN-BashkarNeural"
+    if l.startswith("ta"):
+        return "ta-IN-PallaviNeural"
+    if l.startswith("te"):
+        return "te-IN-ShrutiNeural"
+    if l.startswith("mr"):
+        return "mr-IN-AarohiNeural"
+    if l.startswith("gu"):
+        return "gu-IN-DhwaniNeural"
+    if l.startswith("kn"):
+        return "kn-IN-SapnaNeural"
+    if l.startswith("pa"):
+        return "pa-IN-GeetikaNeural"
+    return default_voice
 
 # Helper: persist JSON between tabs
 if "story_json" not in st.session_state:
@@ -287,7 +310,11 @@ if "story_json_name" not in st.session_state:
 # ---------------------------
 # Tabs
 # ---------------------------
-tab1, tab2, tab3 = st.tabs(["Tab 1 — Notes → JSON", "Tab 2 — JSON → TTS (Azure)", "Tab 3 — JSON → HTML (fill templates)"])
+tab1, tab2, tab3 = st.tabs([
+    "Tab 1 — Notes → JSON",
+    "Tab 2 — JSON → TTS (Azure)",
+    "Tab 3 — JSON → HTML (fill templates)"
+])
 
 # ===========================
 # TAB 1
@@ -317,11 +344,11 @@ with tab1:
             mime = "image/jpeg"
         base64_img = base64.b64encode(raw_bytes).decode("utf-8")
         user_content = [
-            {"type": "text", "text": "Analyze this notes image and return the JSON in the same language."},
+            {"type": "text", "text": "Analyze this notes image and return the JSON."},
             {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64_img}"}}
         ]
 
-        # Azure chat (vision) to get JSON — language-aware
+        # Azure chat (vision) to get JSON (ask for language)
         system_prompt = """
 You are a multilingual teaching assistant. The student has uploaded a notes image.
 
@@ -331,8 +358,8 @@ MANDATORY:
 
 Your job:
 1) Extract a short and catchy title → storytitle (in detected language)
-2) Summarise the whole content into 5 slides (s2paragraph1..s6paragraph1), each ≤ 400 characters (in detected language).
-3) For each paragraph (including the title), write a DALL·E prompt (s1alt1..s6alt1) for a 1024x1024 flat vector illustration: bright colors, clean lines, no text/captions/logos. (Prompts can be in any language, but must not request text in the image.)
+2) Summarise the content into 5 slides (s2paragraph1..s6paragraph1), each ≤ 400 characters (in detected language).
+3) For each paragraph (including the title), write a DALL·E prompt (s1alt1..s6alt1) for a 1024x1024 flat vector illustration: bright colors, clean lines, no text/captions/logos. (Prompts must not request text in the image.)
 
 SAFETY & POSITIVITY RULES (MANDATORY):
 - If the source includes hate, harassment, violence, adult content, self-harm, illegal acts, or extremist symbols, DO NOT reproduce them.
@@ -378,19 +405,15 @@ Respond strictly in this JSON format (keys in English; values in detected langua
                 )
                 st.stop()
             reply = res.json()["choices"][0]["message"]["content"]
-            try:
-                try:
-                    result = json.loads(reply)
-                except Exception:
-                    m = re.search(r"\{[\s\S]*\}", reply)
-                    result = json.loads(m.group(0)) if m else None
-            except Exception as e:
-                st.error(f"Model did not return valid JSON: {e}\n\nRaw:\n{reply[:800]}")
+
+            result = robust_parse_model_json(reply)
+            if not isinstance(result, dict):
+                st.error("Model did not return a valid JSON object.\n\nRaw reply (truncated):\n" + reply[:800])
                 st.stop()
 
-        # Show detected language
-        detected_lang = result.get("language", "").strip() or "(not provided)"
-        st.info(f"Detected language: **{detected_lang}**")
+        detected_lang = str(result.get("language") or "").strip()
+        st.info(f"Detected language: **{detected_lang or '(not provided)'}**")
+
         st.success("Structured JSON created.")
         st.json(result, expanded=False)
 
@@ -398,13 +421,13 @@ Respond strictly in this JSON format (keys in English; values in detected langua
         with st.spinner("Generating DALL·E images and uploading to S3…"):
             final_json = generate_and_upload_images(result)
 
-        # SEO metadata — same language
+        # SEO metadata (in detected language)
         with st.spinner("Generating SEO metadata…"):
-            meta_desc, meta_keywords = generate_seo_metadata(chat_url, chat_headers, final_json)
+            meta_desc, meta_keywords = generate_seo_metadata(chat_url, chat_headers, final_json, detected_lang)
             final_json["metadescription"] = meta_desc
             final_json["metakeywords"] = meta_keywords
 
-        # Save in session for Tab 2/3
+        # Save in session for Tabs 2 & 3
         st.session_state["story_json"] = final_json
         st.session_state["story_json_name"] = (final_json.get("storytitle","story")
                                                .replace(" ", "_").replace(":", "").lower())
@@ -417,7 +440,7 @@ Respond strictly in this JSON format (keys in English; values in detected langua
         json.dump(final_json, buf, ensure_ascii=False, indent=2)
         content_str = buf.getvalue()
 
-        st.success("✅ JSON ready (language-aware, CDN resized URLs included)")
+        st.success("✅ JSON ready (CDN resized URLs included)")
         st.json(final_json, expanded=False)
         st.download_button(
             "⬇️ Download JSON",
@@ -431,11 +454,11 @@ Respond strictly in this JSON format (keys in English; values in detected langua
 # ===========================
 with tab2:
     st.subheader("Convert JSON to Audio (Azure Speech → S3)")
-    st.caption("Uploads MP3 to S3 with UUID names and adds s#audio1 fields to your JSON. Uses the detected language to pick a voice.")
+    st.caption("Uploads MP3 to S3 with UUID names and adds s#audio1 fields to your JSON.")
 
     # Quick sanity for TTS
     missing_tts = []
-    for k in ["AZURE_SPEECH_KEY", "AZURE_SPEECH_REGION", "AWS_ACCESS_KEY", "AWS_SECRET_KEY", "AWS_BUCKET", "S3_PREFIX", "CDN_BASE"]:
+    for k in ["AZURE_SPEECH_KEY", "AZURE_SPEECH_REGION", "VOICE_NAME", "AWS_ACCESS_KEY", "AWS_SECRET_KEY", "AWS_BUCKET", "S3_PREFIX", "CDN_BASE"]:
         if not get_secret(k):
             missing_tts.append(k)
     if missing_tts:
@@ -463,7 +486,6 @@ with tab2:
         # Import Azure Speech SDK
         try:
             import azure.cognitiveservices.speech as speechsdk
-            from azure.cognitiveservices.speech import ResultReason
         except Exception as e:
             st.error("`azure-cognitiveservices-speech` is not installed. Add it to requirements.txt.\n"
                      f"Import error: {e}")
@@ -477,14 +499,12 @@ with tab2:
             region_name=AWS_REGION
         )
 
-        # Pick voice based on detected language (fallback to configured default)
-        detected_lang = (json_data.get("language") or "").strip()
-        chosen_voice = pick_voice_for_language(detected_lang)
-        st.info(f"Using voice: **{chosen_voice}** (detected language: **{detected_lang or 'n/a'}**)")
-
-        # TTS setup
+        # TTS setup (voice selected by detected language)
+        detected_lang = str(json_data.get("language") or "").strip()
+        chosen_voice = pick_voice_for_language(detected_lang, VOICE_NAME_DEFAULT)
         speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION)
         speech_config.speech_synthesis_voice_name = chosen_voice
+        st.info(f"Using voice: **{chosen_voice}** (language: **{detected_lang or 'n/a'}**)")
 
         # Mapping of JSON fields → audio field names
         field_mapping = {
@@ -515,6 +535,7 @@ with tab2:
                 st.error(f"TTS synth failed for {field}: {e}")
                 continue
 
+            from azure.cognitiveservices.speech import ResultReason
             if result.reason == ResultReason.SynthesizingAudioCompleted:
                 # Upload to S3
                 s3_key = f"{S3_PREFIX.rstrip('/')}/audio/{uuid_name}"
@@ -597,8 +618,7 @@ with tab3:
     add_time_fields = st.checkbox("Auto-fill time fields", value=True, help="Adds {{publishedtime}} and {{modifiedtime}} (UTC ISO).")
     extra_fields = {}
     if add_time_fields:
-        from datetime import datetime as _dt
-        iso_now = _dt.utcnow().isoformat(timespec="seconds") + "Z"
+        iso_now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
         extra_fields["publishedtime"] = iso_now
         extra_fields["modifiedtime"] = iso_now
 
@@ -657,6 +677,7 @@ with tab3:
             for name, missing in per_file_reports:
                 st.write(f"• **{name}** → missing: {', '.join(missing)}")
 
+        # Offer all downloads as ZIP
         st.success("✅ Templates filled. Download all as a ZIP:")
         st.download_button(
             "⬇️ Download All Filled HTML (ZIP)",
