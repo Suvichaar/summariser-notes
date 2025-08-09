@@ -145,6 +145,82 @@ def robust_parse_model_json(raw_reply: str):
                 parsed = None
     return parsed if isinstance(parsed, dict) else None
 
+def repair_json_with_model(raw_reply: str, chat_url: str, headers: dict):
+    """Ask the model to fix its own output into valid JSON per schema; returns dict or None."""
+    schema_hint = """
+Keys (English), values in detected language. If any field is missing, use an empty string:
+{
+  "language": "hi|en|bn|ta|te|mr|gu|kn|pa|en-IN|...",
+  "storytitle": "...",
+  "s2paragraph1": "...",
+  "s3paragraph1": "...",
+  "s4paragraph1": "...",
+  "s5paragraph1": "...",
+  "s6paragraph1": "...",
+  "s1alt1": "...",
+  "s2alt1": "...",
+  "s3alt1": "...",
+  "s4alt1": "...",
+  "s5alt1": "...",
+  "s6alt1": "..."
+}
+Return ONLY valid JSON, no code fences, no commentary.
+"""
+    payload_fix = {
+        "messages": [
+            {"role": "system",
+             "content": "You are a strict JSON formatter. You output ONLY valid minified JSON. No prose."},
+            {"role": "user",
+             "content": f"This text was intended to be JSON but is invalid/truncated. "
+                        f"Repair it into valid JSON that matches the schema.\n\nSchema:\n{schema_hint}\n\nText:\n{raw_reply}"}
+        ],
+        "temperature": 0.0,
+        "max_tokens": 1400,
+        "response_format": {"type": "json_object"}
+    }
+    try:
+        r = requests.post(chat_url, headers=headers, json=payload_fix, timeout=150)
+        if r.status_code != 200:
+            return None
+        fixed = r.json()["choices"][0]["message"]["content"]
+        return robust_parse_model_json(fixed)
+    except Exception:
+        return None
+
+def call_azure_chat(messages, *, temperature=0.2, max_tokens=1800, force_json=True):
+    """Call Azure Chat with JSON mode, fallback to non-JSON if needed. Returns (ok, content_or_err)."""
+    chat_headers = {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
+    chat_url = f"{AZURE_ENDPOINT}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
+
+    body = {
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens
+    }
+    if force_json:
+        body["response_format"] = {"type": "json_object"}
+
+    try:
+        res = requests.post(chat_url, headers=chat_headers, json=body, timeout=150)
+    except Exception as e:
+        return False, f"Azure request failed: {e}"
+
+    if res.status_code == 200:
+        return True, res.json()["choices"][0]["message"]["content"]
+
+    # If JSON mode fails (e.g., model not supporting response_format), retry without it
+    if force_json:
+        body.pop("response_format", None)
+        try:
+            res2 = requests.post(chat_url, headers=chat_headers, json=body, timeout=150)
+            if res2.status_code == 200:
+                return True, res2.json()["choices"][0]["message"]["content"]
+            return False, f"Azure Chat error: {res2.status_code} — {res2.text[:300]}"
+        except Exception as e:
+            return False, f"Azure retry failed: {e}"
+
+    return False, f"Azure Chat error: {res.status_code} — {res.text[:300]}"
+
 def generate_and_upload_images(result_json: dict) -> dict:
     """Generate DALL·E images, upload originals to S3, return CDN resized URLs in JSON."""
     if not all([DALE_ENDPOINT, DAALE_KEY, AWS_ACCESS_KEY, AWS_SECRET_KEY, AWS_BUCKET]):
@@ -260,10 +336,11 @@ Respond strictly in this JSON format:
             {"role": "user", "content": seo_prompt}
         ],
         "temperature": 0.5,
-        "max_tokens": 300
+        "max_tokens": 400,
+        "response_format": {"type": "json_object"}
     }
     try:
-        r = requests.post(chat_url, headers=headers, json=payload_seo, timeout=60)
+        r = requests.post(chat_url, headers=headers, json=payload_seo, timeout=90)
         if r.status_code != 200:
             return "Explore this insightful story.", "web story, inspiration"
         content = r.json()["choices"][0]["message"]["content"]
@@ -348,7 +425,7 @@ with tab1:
             {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64_img}"}}
         ]
 
-        # Azure chat (vision) to get JSON (ask for language)
+        # Azure chat (vision) to get JSON (ask for language) — try JSON mode first
         system_prompt = """
 You are a multilingual teaching assistant. The student has uploaded a notes image.
 
@@ -385,30 +462,28 @@ Respond strictly in this JSON format (keys in English; values in detected langua
   "s6alt1": "..."
 }
 """
-        chat_headers = {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
-        chat_url = f"{AZURE_ENDPOINT}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
-        payload = {
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content}
-            ],
-            "temperature": 0.7,
-            "max_tokens": 1200
-        }
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content}
+        ]
 
         with st.spinner("Generating structured JSON from the image…"):
-            res = requests.post(chat_url, headers=chat_headers, json=payload, timeout=150)
-            if res.status_code != 200:
-                st.error(
-                    f"Azure Chat error: {res.status_code} — {res.text[:300]}\n\n"
-                    "Tip: ensure AZURE_DEPLOYMENT is a vision-capable model like 'gpt-4o' or 'gpt-4o-mini'."
-                )
+            ok, content = call_azure_chat(messages, temperature=0.2, max_tokens=1800, force_json=True)
+            if not ok:
+                st.error(content)
                 st.stop()
-            reply = res.json()["choices"][0]["message"]["content"]
 
-            result = robust_parse_model_json(reply)
+            result = robust_parse_model_json(content)
             if not isinstance(result, dict):
-                st.error("Model did not return a valid JSON object.\n\nRaw reply (truncated):\n" + reply[:800])
+                # Try one-shot repair
+                chat_headers = {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
+                chat_url = f"{AZURE_ENDPOINT}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
+                fixed = repair_json_with_model(content, chat_url, chat_headers)
+                if isinstance(fixed, dict):
+                    result = fixed
+
+            if not isinstance(result, dict):
+                st.error("Model did not return a valid JSON object.\n\nRaw reply (truncated):\n" + content[:800])
                 st.stop()
 
         detected_lang = str(result.get("language") or "").strip()
@@ -423,6 +498,8 @@ Respond strictly in this JSON format (keys in English; values in detected langua
 
         # SEO metadata (in detected language)
         with st.spinner("Generating SEO metadata…"):
+            chat_headers = {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
+            chat_url = f"{AZURE_ENDPOINT}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
             meta_desc, meta_keywords = generate_seo_metadata(chat_url, chat_headers, final_json, detected_lang)
             final_json["metadescription"] = meta_desc
             final_json["metakeywords"] = meta_keywords
