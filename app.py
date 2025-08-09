@@ -2,6 +2,7 @@
 # ------------------------------------------------------------
 # Tab 1: Notes Image → GPT JSON → Safe DALL·E Images → S3 → JSON (CDN resized URLs)
 # Tab 2: JSON → Azure Speech TTS MP3 → S3 → add audio fields to JSON
+# Tab 3: Fill multiple HTML templates using JSON from Tab 1/2 (or upload)
 # ------------------------------------------------------------
 import os
 import io
@@ -12,6 +13,7 @@ import base64
 import requests
 import boto3
 import mimetypes
+import zipfile
 from io import BytesIO
 from datetime import datetime
 from PIL import Image
@@ -26,7 +28,7 @@ st.set_page_config(
     layout="centered"
 )
 st.title("🧠 Suvichaar Tools")
-st.caption("Tab 1: Notes → JSON + Images | Tab 2: JSON → TTS MP3")
+st.caption("Tab 1: Notes → JSON + Images | Tab 2: JSON → TTS MP3 | Tab 3: JSON → HTML (fill templates)")
 
 # ---------------------------
 # Secrets / Config
@@ -78,7 +80,7 @@ if missing_core:
     st.warning("Add these secrets in `.streamlit/secrets.toml`: " + ", ".join(missing_core))
 
 # ---------------------------
-# Shared helpers (Tab 1)
+# Shared helpers
 # ---------------------------
 def build_resized_cdn_url(bucket: str, key_path: str, width: int, height: int) -> str:
     """Return base64-encoded template URL for your Serverless Image Handler."""
@@ -259,10 +261,16 @@ Respond strictly in this JSON format:
     except Exception:
         return "Explore this insightful story.", "web story, inspiration"
 
+# Helper: persist JSON between tabs
+if "story_json" not in st.session_state:
+    st.session_state["story_json"] = None
+if "story_json_name" not in st.session_state:
+    st.session_state["story_json_name"] = None
+
 # ---------------------------
 # Tabs
 # ---------------------------
-tab1, tab2 = st.tabs(["Tab 1 — Notes → JSON", "Tab 2 — JSON → TTS (Azure)"])
+tab1, tab2, tab3 = st.tabs(["Tab 1 — Notes → JSON", "Tab 2 — JSON → TTS (Azure)", "Tab 3 — JSON → HTML (fill templates)"])
 
 # ===========================
 # TAB 1
@@ -371,8 +379,13 @@ Respond strictly in this JSON format:
             final_json["metadescription"] = meta_desc
             final_json["metakeywords"] = meta_keywords
 
+        # Save in session for Tab 3
+        st.session_state["story_json"] = final_json
+        st.session_state["story_json_name"] = (final_json.get("storytitle","story")
+                                               .replace(" ", "_").replace(":", "").lower())
+
         # Download JSON
-        safe_title = result["storytitle"].replace(" ", "_").replace(":", "").lower()
+        safe_title = st.session_state["story_json_name"]
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_name = f"{safe_title}_{ts}.json"
         buf = io.StringIO()
@@ -403,18 +416,20 @@ with tab2:
     if missing_tts:
         st.info("(TTS) Missing in secrets: " + ", ".join(missing_tts))
 
-    json_file = st.file_uploader("Upload your story JSON", type=["json"], key="json_uploader_tab2")
+    json_file = st.file_uploader("Upload your story JSON (or use Tab 1 output via Tab 3)", type=["json"], key="json_uploader_tab2")
     run_tts = st.button("Generate Audio & Update JSON", key="btn_tab2")
 
     if run_tts:
-        if not json_file:
-            st.error("Please upload a JSON file first.")
-            st.stop()
-
-        try:
-            json_data = json.load(json_file)
-        except Exception as e:
-            st.error(f"Could not parse JSON: {e}")
+        if json_file:
+            try:
+                json_data = json.load(json_file)
+            except Exception as e:
+                st.error(f"Could not parse JSON: {e}")
+                st.stop()
+        elif st.session_state.get("story_json"):
+            json_data = dict(st.session_state["story_json"])
+        else:
+            st.error("Please upload a JSON file first (or generate one in Tab 1).")
             st.stop()
 
         st.success("✅ JSON loaded.")
@@ -459,13 +474,19 @@ with tab2:
 
             # Local output file
             uuid_name = f"{os.urandom(16).hex()}.mp3"
-            audio_config = speechsdk.audio.AudioOutputConfig(filename=uuid_name)
-            synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
+            try:
+                import azure.cognitiveservices.speech as speechsdk
+                audio_config = speechsdk.audio.AudioOutputConfig(filename=uuid_name)
+                synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
 
-            st.write(f"🎙️ Synthesizing: {field} → {uuid_name}")
-            result = synthesizer.speak_text_async(text).get()
+                st.write(f"🎙️ Synthesizing: {field} → {uuid_name}")
+                result = synthesizer.speak_text_async(text).get()
+            except Exception as e:
+                st.error(f"TTS synth failed for {field}: {e}")
+                continue
 
-            if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+            from azure.cognitiveservices.speech import ResultReason
+            if result.reason == ResultReason.SynthesizingAudioCompleted:
                 # Upload to S3
                 s3_key = f"{S3_PREFIX.rstrip('/')}/audio/{uuid_name}"
                 try:
@@ -488,9 +509,13 @@ with tab2:
             st.success("✅ Audio URLs added to JSON")
             st.json(created, expanded=False)
 
+        # Persist to session for Tab 3
+        st.session_state["story_json"] = json_data
+        st.session_state["story_json_name"] = (json_data.get("storytitle","updated_story")
+                                               .replace(" ", "_").replace(":", "").lower())
+
         # Prepare updated JSON download
-        safe_title = (json_data.get("storytitle","updated_story")
-                      .replace(" ", "_").replace(":", "").lower())
+        safe_title = st.session_state["story_json_name"]
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_name = f"{safe_title}_with_audio_{ts}.json"
 
@@ -504,3 +529,120 @@ with tab2:
             file_name=out_name,
             mime="application/json"
         )
+
+# ===========================
+# TAB 3 — JSON → HTML (fill templates)
+# ===========================
+with tab3:
+    st.subheader("Fill HTML templates with your JSON (multi-file)")
+    st.caption("Uses the JSON generated in Tab 1/2, or upload your own JSON here.")
+
+    # Source selection
+    use_session = st.checkbox("Use JSON from Tab 1/2 (session)", value=True)
+    uploaded_json_for_tab3 = None
+    if not use_session:
+        uploaded_json_for_tab3 = st.file_uploader("Upload a JSON file", type=["json"], key="json_uploader_tab3")
+
+    # Load JSON
+    story_json = None
+    if use_session:
+        story_json = st.session_state.get("story_json")
+        if story_json:
+            st.success("✅ Using JSON from session (Tab 1/2).")
+            st.json(story_json, expanded=False)
+        else:
+            st.info("No JSON in session yet. Upload one below or generate in Tab 1/2.")
+    else:
+        if uploaded_json_for_tab3:
+            try:
+                story_json = json.load(uploaded_json_for_tab3)
+                st.success("✅ Uploaded JSON loaded.")
+                st.json(story_json, expanded=False)
+            except Exception as e:
+                st.error(f"Could not parse JSON: {e}")
+
+    # HTML templates upload (multiple)
+    html_files = st.file_uploader("Upload one or more HTML templates (with {{placeholders}})", type=["html", "htm"], accept_multiple_files=True)
+
+    # Optional: add dynamic fields to JSON before filling
+    add_time_fields = st.checkbox("Auto-fill time fields", value=True, help="Adds {{publishedtime}} and {{modifiedtime}} (UTC ISO).")
+    extra_fields = {}
+    if add_time_fields:
+        iso_now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        extra_fields["publishedtime"] = iso_now
+        extra_fields["modifiedtime"] = iso_now
+
+    # Simple replacer: replace {{key}} with string(value)
+    def fill_template_strict(template: str, data: dict) -> str:
+        # Also list placeholders present to show missing keys
+        placeholders = set(re.findall(r"\{\{\s*([a-zA-Z0-9_\-]+)\s*\}\}", template))
+        # Replace
+        for k, v in data.items():
+            template = template.replace(f"{{{{{k}}}}}", str(v))
+        return template, placeholders
+
+    if st.button("Fill Templates", key="btn_tab3"):
+        if not story_json:
+            st.error("Provide JSON (session or upload) first.")
+            st.stop()
+        if not html_files:
+            st.error("Upload at least one HTML template.")
+            st.stop()
+
+        # Merge extra fields into a working copy
+        merged = dict(story_json)
+        merged.update(extra_fields)
+
+        # Try to infer a base name
+        base_name = (merged.get("storytitle","webstory")
+                     .replace(" ", "_").replace(":", "").lower())
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        zip_buf = BytesIO()
+        z = zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED)
+
+        per_file_reports = []
+        for f in html_files:
+            try:
+                html_text = f.read().decode("utf-8")
+            except Exception:
+                st.error(f"Could not read {f.name} as UTF-8.")
+                continue
+
+            filled, placeholders = fill_template_strict(html_text, merged)
+
+            # Report missing placeholders
+            missing = sorted([p for p in placeholders if f"{{{{{p}}}}}" in html_text and p not in merged])
+            if missing:
+                per_file_reports.append((f.name, missing))
+
+            out_filename = f"{base_name}__{os.path.splitext(f.name)[0]}__{ts}.html"
+            z.writestr(out_filename, filled)
+
+        z.close()
+        zip_buf.seek(0)
+
+        if per_file_reports:
+            st.warning("Some templates contain placeholders not found in JSON:")
+            for name, missing in per_file_reports:
+                st.write(f"• **{name}** → missing: {', '.join(missing)}")
+
+        # Offer individual downloads too
+        st.success("✅ Templates filled. Download all as a ZIP:")
+        st.download_button(
+            "⬇️ Download All Filled HTML (ZIP)",
+            data=zip_buf,
+            file_name=f"{base_name}__filled_{ts}.zip",
+            mime="application/zip"
+        )
+
+        # (Optional) Show first filled file preview (sanitized)
+        show_preview = st.checkbox("Show preview of first filled template", value=False)
+        if show_preview:
+            with zipfile.ZipFile(BytesIO(zip_buf.getvalue()), "r") as z2:
+                names = z2.namelist()
+                if names:
+                    sample_html = z2.read(names[0]).decode("utf-8", errors="ignore")
+                    st.code(sample_html[:5000], language="html")
+                else:
+                    st.info("ZIP is empty (unexpected).")
