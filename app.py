@@ -1,3 +1,8 @@
+# app.py
+# ------------------------------------------------------------
+# Tab 1: Notes Image → GPT JSON → Safe DALL·E Images → S3 → JSON (CDN resized URLs)
+# Tab 2: JSON → Azure Speech TTS MP3 → S3 → add audio fields to JSON
+# ------------------------------------------------------------
 import os
 import io
 import re
@@ -16,12 +21,12 @@ import streamlit as st
 # Page config
 # ---------------------------
 st.set_page_config(
-    page_title="Notes → JSON (GPT + DALL·E + S3)",
+    page_title="Suvichaar Tools",
     page_icon="🧠",
     layout="centered"
 )
-st.title("🧠 Notes → JSON (GPT + DALL·E + S3)")
-st.caption("Upload a notes image → JSON (title/slides/prompts), generate DALL·E images → S3, return CDN resized URLs, download JSON.")
+st.title("🧠 Suvichaar Tools")
+st.caption("Tab 1: Notes → JSON + Images | Tab 2: JSON → TTS MP3")
 
 # ---------------------------
 # Secrets / Config
@@ -32,38 +37,51 @@ def get_secret(key, default=None):
     except Exception:
         return default
 
+# Azure OpenAI (vision)
 AZURE_API_KEY     = get_secret("AZURE_API_KEY")
 AZURE_ENDPOINT    = get_secret("AZURE_ENDPOINT")
 AZURE_DEPLOYMENT  = get_secret("AZURE_DEPLOYMENT", "gpt-4o")  # vision-capable model
 AZURE_API_VERSION = get_secret("AZURE_API_VERSION", "2024-08-01-preview")
 
+# Azure DALL·E
 DALE_ENDPOINT     = get_secret("DALE_ENDPOINT")  # full Azure DALL·E images/generations endpoint
 DAALE_KEY         = get_secret("DAALE_KEY")
 
+# AWS S3
 AWS_ACCESS_KEY    = get_secret("AWS_ACCESS_KEY")
 AWS_SECRET_KEY    = get_secret("AWS_SECRET_KEY")
 AWS_REGION        = get_secret("AWS_REGION", "ap-south-1")
 AWS_BUCKET        = get_secret("AWS_BUCKET")
 S3_PREFIX         = get_secret("S3_PREFIX", "media")
 
-# Prefix for your Serverless Image Handler / CloudFront that takes base64 template
+# CDN image handler prefix (base64-encoded template)
 CDN_PREFIX_MEDIA  = get_secret("CDN_PREFIX_MEDIA", "https://media.suvichaar.org/")
 
+# Fallback image
 DEFAULT_ERROR_IMAGE = get_secret("DEFAULT_ERROR_IMAGE", "https://media.suvichaar.org/default-error.jpg")
 
-# Sanity check
-missing = []
-for k in ["AZURE_API_KEY", "AZURE_ENDPOINT", "AZURE_DEPLOYMENT", "DALE_ENDPOINT", "DAALE_KEY", "AWS_ACCESS_KEY", "AWS_SECRET_KEY", "AWS_BUCKET"]:
+# Azure Speech (TTS)
+AZURE_SPEECH_KEY     = get_secret("AZURE_SPEECH_KEY")
+AZURE_SPEECH_REGION  = get_secret("AZURE_SPEECH_REGION", "eastus")
+VOICE_NAME           = get_secret("VOICE_NAME", "hi-IN-AaravNeural")
+
+# CDN for audio files (served via CloudFront)
+CDN_BASE             = get_secret("CDN_BASE", "https://cdn.suvichaar.org/")
+
+# Sanity checks
+missing_core = []
+for k in ["AZURE_API_KEY", "AZURE_ENDPOINT", "AZURE_DEPLOYMENT", "DALE_ENDPOINT", "DAALE_KEY",
+          "AWS_ACCESS_KEY", "AWS_SECRET_KEY", "AWS_BUCKET"]:
     if not get_secret(k):
-        missing.append(k)
-if missing:
-    st.warning("Add these secrets in `.streamlit/secrets.toml`: " + ", ".join(missing))
+        missing_core.append(k)
+if missing_core:
+    st.warning("Add these secrets in `.streamlit/secrets.toml`: " + ", ".join(missing_core))
 
 # ---------------------------
-# Helpers
+# Shared helpers (Tab 1)
 # ---------------------------
 def build_resized_cdn_url(bucket: str, key_path: str, width: int, height: int) -> str:
-    """Return base64-encoded template URL for your image handler."""
+    """Return base64-encoded template URL for your Serverless Image Handler."""
     template = {
         "bucket": bucket,
         "key": key_path,
@@ -86,7 +104,7 @@ SAFE_FALLBACK = (
 )
 
 def sanitize_prompt(chat_url: str, headers: dict, original_prompt: str) -> str:
-    """Rewrite any risky prompt into a safe, positive, family-friendly version using the same Azure chat endpoint."""
+    """Rewrite any risky prompt into a safe, positive, family-friendly version using Azure Chat."""
     sanitize_payload = {
         "messages": [
             {"role": "system", "content": (
@@ -139,7 +157,6 @@ def generate_and_upload_images(result_json: dict) -> dict:
 
     for i in range(1, 7):
         raw_prompt = result_json.get(f"s{i}alt1", "") or ""
-        # sanitize via chat (reuse the same chat endpoint)
         chat_headers = {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
         chat_url = f"{AZURE_ENDPOINT}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
         safe_prompt = sanitize_prompt(chat_url, chat_headers, raw_prompt)
@@ -170,8 +187,7 @@ def generate_and_upload_images(result_json: dict) -> dict:
         if image_url:
             try:
                 img_data = requests.get(image_url, timeout=120).content
-                # upload original (no local resize)
-                buffer = BytesIO(img_data)
+                buffer = BytesIO(img_data)  # upload original; no local resize
                 key = f"{S3_PREFIX.rstrip('/')}/{slug}/slide{i}.jpg"
                 s3.upload_fileobj(buffer, AWS_BUCKET, key, ExtraArgs={"ContentType": "image/jpeg"})
                 if i == 1:
@@ -244,38 +260,44 @@ Respond strictly in this JSON format:
         return "Explore this insightful story.", "web story, inspiration"
 
 # ---------------------------
-# UI
+# Tabs
 # ---------------------------
-uploaded_img = st.file_uploader("Upload a notes image (JPG/PNG)", type=["jpg", "jpeg", "png"])
-if st.button("Generate JSON"):
-    if not uploaded_img:
-        st.error("Please upload an image first.")
-        st.stop()
+tab1, tab2 = st.tabs(["Tab 1 — Notes → JSON", "Tab 2 — JSON → TTS (Azure)"])
 
-    # Read bytes + preview
-    try:
-        raw_bytes = uploaded_img.getvalue()
-        if not raw_bytes:
-            st.error("Uploaded file is empty.")
+# ===========================
+# TAB 1
+# ===========================
+with tab1:
+    uploaded_img = st.file_uploader("Upload a notes image (JPG/PNG)", type=["jpg", "jpeg", "png"])
+    if st.button("Generate JSON", key="btn_tab1"):
+        if not uploaded_img:
+            st.error("Please upload an image first.")
             st.stop()
-        img = Image.open(BytesIO(raw_bytes)).convert("RGB")
-        st.image(img, caption="Uploaded image", use_container_width=True)
-    except Exception as e:
-        st.error(f"Could not open image: {e}")
-        st.stop()
 
-    # Correct data URL with MIME
-    mime = uploaded_img.type or "image/jpeg"
-    if not (isinstance(mime, str) and mime.startswith("image/")):
-        mime = "image/jpeg"
-    base64_img = base64.b64encode(raw_bytes).decode("utf-8")
-    user_content = [
-        {"type": "text", "text": "Analyze this notes image and return the JSON."},
-        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64_img}"}}
-    ]
+        # Read bytes + preview
+        try:
+            raw_bytes = uploaded_img.getvalue()
+            if not raw_bytes:
+                st.error("Uploaded file is empty.")
+                st.stop()
+            img = Image.open(BytesIO(raw_bytes)).convert("RGB")
+            st.image(img, caption="Uploaded image", use_container_width=True)
+        except Exception as e:
+            st.error(f"Could not open image: {e}")
+            st.stop()
 
-    # Azure chat call (vision)
-    system_prompt = """
+        # Correct data URL with MIME
+        mime = uploaded_img.type or "image/jpeg"
+        if not (isinstance(mime, str) and mime.startswith("image/")):
+            mime = "image/jpeg"
+        base64_img = base64.b64encode(raw_bytes).decode("utf-8")
+        user_content = [
+            {"type": "text", "text": "Analyze this notes image and return the JSON."},
+            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{base64_img}"}}
+        ]
+
+        # Azure chat (vision) to get JSON
+        system_prompt = """
 You are a teaching assistant. The student has uploaded a notes image.
 
 Your job:
@@ -306,62 +328,179 @@ Respond strictly in this JSON format:
   "s6alt1": "..."
 }
 """
-    chat_headers = {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
-    chat_url = f"{AZURE_ENDPOINT}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
-    payload = {
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content}
-        ],
-        "temperature": 0.7,
-        "max_tokens": 1000
-    }
+        chat_headers = {"Content-Type": "application/json", "api-key": AZURE_API_KEY}
+        chat_url = f"{AZURE_ENDPOINT}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
+        payload = {
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ],
+            "temperature": 0.7,
+            "max_tokens": 1000
+        }
 
-    with st.spinner("Generating structured JSON from the image…"):
-        res = requests.post(chat_url, headers=chat_headers, json=payload, timeout=120)
-        if res.status_code != 200:
-            st.error(
-                f"Azure Chat error: {res.status_code} — {res.text[:300]}\n\n"
-                "Tip: ensure AZURE_DEPLOYMENT is a vision-capable model like 'gpt-4o' or 'gpt-4o-mini'."
-            )
-            st.stop()
-        reply = res.json()["choices"][0]["message"]["content"]
-        try:
+        with st.spinner("Generating structured JSON from the image…"):
+            res = requests.post(chat_url, headers=chat_headers, json=payload, timeout=120)
+            if res.status_code != 200:
+                st.error(
+                    f"Azure Chat error: {res.status_code} — {res.text[:300]}\n\n"
+                    "Tip: ensure AZURE_DEPLOYMENT is a vision-capable model like 'gpt-4o' or 'gpt-4o-mini'."
+                )
+                st.stop()
+            reply = res.json()["choices"][0]["message"]["content"]
             try:
-                result = json.loads(reply)
-            except Exception:
-                m = re.search(r"\{[\s\S]*\}", reply)
-                result = json.loads(m.group(0)) if m else None
-        except Exception as e:
-            st.error(f"Model did not return valid JSON: {e}\n\nRaw:\n{reply[:500]}")
+                try:
+                    result = json.loads(reply)
+                except Exception:
+                    m = re.search(r"\{[\s\S]*\}", reply)
+                    result = json.loads(m.group(0)) if m else None
+            except Exception as e:
+                st.error(f"Model did not return valid JSON: {e}\n\nRaw:\n{reply[:500]}")
+                st.stop()
+
+        st.success("Structured JSON created.")
+        st.json(result, expanded=False)
+
+        # Generate DALL·E images → S3 → CDN URLs
+        with st.spinner("Generating DALL·E images and uploading to S3…"):
+            final_json = generate_and_upload_images(result)
+
+        # SEO metadata
+        with st.spinner("Generating SEO metadata…"):
+            meta_desc, meta_keywords = generate_seo_metadata(chat_url, chat_headers, result)
+            final_json["metadescription"] = meta_desc
+            final_json["metakeywords"] = meta_keywords
+
+        # Download JSON
+        safe_title = result["storytitle"].replace(" ", "_").replace(":", "").lower()
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_name = f"{safe_title}_{ts}.json"
+        buf = io.StringIO()
+        json.dump(final_json, buf, ensure_ascii=False, indent=2)
+        content_str = buf.getvalue()
+
+        st.success("✅ JSON ready (CDN resized URLs included)")
+        st.json(final_json, expanded=False)
+        st.download_button(
+            "⬇️ Download JSON",
+            data=content_str.encode("utf-8"),
+            file_name=out_name,
+            mime="application/json"
+        )
+
+# ===========================
+# TAB 2 — JSON → Azure TTS
+# ===========================
+with tab2:
+    st.subheader("Convert JSON to Audio (Azure Speech → S3)")
+    st.caption("Uploads MP3 to S3 with UUID names and adds s#audio1 fields to your JSON.")
+
+    # Quick sanity for TTS
+    missing_tts = []
+    for k in ["AZURE_SPEECH_KEY", "AZURE_SPEECH_REGION", "VOICE_NAME", "AWS_ACCESS_KEY", "AWS_SECRET_KEY", "AWS_BUCKET", "S3_PREFIX", "CDN_BASE"]:
+        if not get_secret(k):
+            missing_tts.append(k)
+    if missing_tts:
+        st.info("(TTS) Missing in secrets: " + ", ".join(missing_tts))
+
+    json_file = st.file_uploader("Upload your story JSON", type=["json"], key="json_uploader_tab2")
+    run_tts = st.button("Generate Audio & Update JSON", key="btn_tab2")
+
+    if run_tts:
+        if not json_file:
+            st.error("Please upload a JSON file first.")
             st.stop()
 
-    st.success("Structured JSON created.")
-    st.json(result, expanded=False)
+        try:
+            json_data = json.load(json_file)
+        except Exception as e:
+            st.error(f"Could not parse JSON: {e}")
+            st.stop()
 
-    # Generate DALL·E images → S3 → CDN URLs
-    with st.spinner("Generating DALL·E images and uploading to S3…"):
-        final_json = generate_and_upload_images(result)
+        st.success("✅ JSON loaded.")
+        st.json(json_data, expanded=False)
 
-    # SEO metadata
-    with st.spinner("Generating SEO metadata…"):
-        meta_desc, meta_keywords = generate_seo_metadata(chat_url, chat_headers, result)
-        final_json["metadescription"] = meta_desc
-        final_json["metakeywords"] = meta_keywords
+        # Import Azure Speech SDK
+        try:
+            import azure.cognitiveservices.speech as speechsdk
+        except Exception as e:
+            st.error("`azure-cognitiveservices-speech` is not installed. Add it to requirements.txt.\n"
+                     f"Import error: {e}")
+            st.stop()
 
-    # Save JSON to memory, show + download
-    safe_title = result["storytitle"].replace(" ", "_").replace(":", "").lower()
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_name = f"{safe_title}_{ts}.json"
-    buf = io.StringIO()
-    json.dump(final_json, buf, ensure_ascii=False, indent=2)
-    content_str = buf.getvalue()
+        # Prepare AWS S3 client
+        s3 = boto3.client(
+            "s3",
+            aws_access_key_id=AWS_ACCESS_KEY,
+            aws_secret_access_key=AWS_SECRET_KEY,
+            region_name=AWS_REGION
+        )
 
-    st.success("✅ JSON ready (CDN resized URLs included)")
-    st.json(final_json, expanded=False)
-    st.download_button(
-        "⬇️ Download JSON",
-        data=content_str.encode("utf-8"),
-        file_name=out_name,
-        mime="application/json"
-    )
+        # TTS setup
+        speech_config = speechsdk.SpeechConfig(subscription=AZURE_SPEECH_KEY, region=AZURE_SPEECH_REGION)
+        speech_config.speech_synthesis_voice_name = VOICE_NAME
+
+        # Mapping of JSON fields → audio field names
+        field_mapping = {
+            "storytitle":    "s1audio1",
+            "s2paragraph1":  "s2audio1",
+            "s3paragraph1":  "s3audio1",
+            "s4paragraph1":  "s4audio1",
+            "s5paragraph1":  "s5audio1",
+            "s6paragraph1":  "s6audio1",
+        }
+
+        created = {}
+        for field, audio_key in field_mapping.items():
+            text = json_data.get(field)
+            if not text:
+                st.info(f"⚠️ Field missing: {field}")
+                continue
+
+            # Local output file
+            uuid_name = f"{os.urandom(16).hex()}.mp3"
+            audio_config = speechsdk.audio.AudioOutputConfig(filename=uuid_name)
+            synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=audio_config)
+
+            st.write(f"🎙️ Synthesizing: {field} → {uuid_name}")
+            result = synthesizer.speak_text_async(text).get()
+
+            if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+                # Upload to S3
+                s3_key = f"{S3_PREFIX.rstrip('/')}/audio/{uuid_name}"
+                try:
+                    s3.upload_file(uuid_name, AWS_BUCKET, s3_key, ExtraArgs={"ContentType": "audio/mpeg"})
+                    cdn_url = f"{CDN_BASE.rstrip('/')}/{s3_key}"
+                    json_data[audio_key] = cdn_url
+                    created[field] = cdn_url
+                    st.write(f"✅ Uploaded to: {cdn_url}")
+                except Exception as e:
+                    st.error(f"Upload failed for {field}: {e}")
+                finally:
+                    try:
+                        os.remove(uuid_name)
+                    except Exception:
+                        pass
+            else:
+                st.error(f"❌ Failed to synthesize: {field}")
+
+        if created:
+            st.success("✅ Audio URLs added to JSON")
+            st.json(created, expanded=False)
+
+        # Prepare updated JSON download
+        safe_title = (json_data.get("storytitle","updated_story")
+                      .replace(" ", "_").replace(":", "").lower())
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_name = f"{safe_title}_with_audio_{ts}.json"
+
+        buf = io.StringIO()
+        json.dump(json_data, buf, ensure_ascii=False, indent=2)
+        content_str = buf.getvalue()
+
+        st.download_button(
+            "⬇️ Download Updated JSON (with audio fields)",
+            data=content_str.encode("utf-8"),
+            file_name=out_name,
+            mime="application/json"
+        )
